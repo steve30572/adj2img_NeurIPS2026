@@ -1,6 +1,6 @@
-# 🧩 adj2img: Argument Descriptions
+# 🧩 adj2img
 
-This document provides an overview of the command-line arguments used to configure and run experiments with **adj2img**, a framework that transforms adjacency information into image-like representations for graph-based learning.
+This document provides an overview of how to configure and run experiments with **adj2img**, a framework that transforms adjacency information into image-like representations for graph-based learning.
 
 ---
 
