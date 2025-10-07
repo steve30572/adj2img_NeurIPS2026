@@ -41,6 +41,12 @@ This document provides an overview of the command-line arguments used to configu
 | `--img_embed_num` | `int` | `100` | Number of structural prototype tokens used for image embedding. Controls the granularity of structural pattern representation. |
 
 ---
+## Before running the examples
+```bash
+mkdir graphon
+mkdir image
+mkdir results
+```
 
 ## 🧠 Example Usage
 ```bash
