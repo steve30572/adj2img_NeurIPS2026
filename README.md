@@ -63,6 +63,7 @@ python main.py \
   --img_embed_num 200 \
   --missing_rate 0 \
   --seed 42
+```
 
 ## Hyperparameters for each dataset
 
@@ -74,3 +75,12 @@ python main.py \
 | squirrel      | 3    | 512      | 64        | 4          | 1         | 64     | 0.7     | 0.001    | 50            | 
 | ogbn-arxiv    | 3    | 512      | 512       | 1          | 16         | 256     | 0.9     | 0.0001   | 20            |
 
+## Dataset statistics
+
+| Dataset     | Nodes  | Edges  | Features | Classes |
+|-------------|--------|--------|----------|---------|
+| cora        | 2,708  | 5,429  | 1,433    | 7       |
+| citeseer    | 3,327  | 4,732  | 3,703    | 6       | 
+| chameleon   | 2,277  | 36,101 | 2,325    | 5       | 
+| squirrel    | 5,201  | 198,493| 2,089    | 5       | 
+| ogbn-arxiv  | 169,343| 1,166,243 | 128    | 40      |
