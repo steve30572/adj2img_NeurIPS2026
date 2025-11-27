@@ -63,3 +63,14 @@ python main.py \
   --img_embed_num 200 \
   --missing_rate 0 \
   --seed 42
+
+## Hyperparameters for each dataset
+
+| Dataset       | hops | img_size | embed_dim | num_layers | num_heads | mlp_dim | dropout | lr      | img_embed_num | 
+|---------------|------|----------|-----------|------------|-----------|---------|---------|----------|----------------|
+| cora          | 3    | 512      | 256        | 1          | 1         | 512     | 0.9     | 0.001    | 20            | 
+| citeseer      | 3    | 512      | 256        | 4          | 1         | 128     | 0.7     | 0.001    | 50            | 
+| chameleon     | 3    | 512      | 64        | 2          | 1         | 128     | 0.7     | 0.001    | 200            |
+| squirrel      | 3    | 512      | 64        | 4          | 1         | 64     | 0.7     | 0.001    | 50            | 
+| ogbn-arxiv    | 3    | 512      | 512       | 1          | 16         | 256     | 0.9     | 0.0001   | 20            |
+
