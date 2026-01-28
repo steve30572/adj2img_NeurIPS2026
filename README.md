@@ -1,6 +1,6 @@
-# 🧩 adj2img
+# 🧩 A2I
 
-This document provides an overview of how to configure and run experiments with **adj2img**, a framework that transforms adjacency information into image-like representations for graph-based learning.
+This document provides an overview of how to configure and run experiments with **A2I**, a framework that transforms adjacency information into image-like representations for graph-based learning.
 
 ---
 
