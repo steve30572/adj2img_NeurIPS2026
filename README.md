@@ -32,8 +32,8 @@ This document provides an overview of how to configure and run experiments with 
 | `--lr` | `float` | `0.001` | Learning rate for model optimization. Adjust for training stability and convergence speed. |
 | `--seed` | `int` | `2026` | Random seed to ensure experiment reproducibility. |
 | `--missing_rate` | `int` | `0` | Option of node features to randomly mask during training, used to simulate incomplete feature settings. |
-| `--mode` | 'string` | `homo` | Option of homophily dataset or heterophily dataset.|
-| `--model` | 'string` | `gcn` | Option of aggregation methods (gcn, gat, or sage).|
+| `--mode` | `string` | `homo` | Option of homophily dataset or heterophily dataset.|
+| `--model` | `string` | `gcn` | Option of aggregation methods (gcn, gat, or sage).|
 
 ---
 
