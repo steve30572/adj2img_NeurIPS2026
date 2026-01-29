@@ -2,11 +2,13 @@ import torch
 import networkx as nx
 from torch_geometric.datasets import Planetoid, WikipediaNetwork, HeterophilousGraphDataset, WebKB, Actor, Amazon
 from torch_geometric.utils import to_networkx
-from torch_geometric.utils import to_undirected, remove_self_loops, add_self_loops
 from torch_geometric.data import Data
 from ogb.nodeproppred import PygNodePropPredDataset
 from utils import *
 from model import *
+from torch.utils.data import Dataset, DataLoader
+
+from tqdm import tqdm
 
 import torch_geometric.transforms as T
 
@@ -21,7 +23,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--hops', type=int, default=3)
 parser.add_argument('--img_size', type=int, default=512)
 parser.add_argument('--dataset_name', type=str, default='chameleon')
+# parser.add_argument('--save_file', type=str, default=f'./graphon/{dataset_name}.pt')
 parser.add_argument('--embed_dim', type=int, default=64) # 128 256 512
+#embed_dim, num_layers, num_heads, mlp_dim, dropout
 parser.add_argument('--num_layers', type=int, default=12) # 2 3 4
 parser.add_argument('--num_heads', type=int, default=4) # 16 32
 parser.add_argument('--mlp_dim', type=int, default=64) # 128 256 512
@@ -42,7 +46,7 @@ save_file = args.save_file
 
 set_seed(args.seed)
 
-device = "cpu"
+device = "cpu"#f"cuda:0" if torch.cuda.is_available() else "cpu"
 
 transform = T.Compose([
     T.ToUndirected(),
@@ -79,7 +83,7 @@ elif args.dataset_name =='actor':
 
     data = random_planetoid_splits(data, dataset.num_classes, percls_trn, val_lb)
 elif args.dataset_name == 'roman-empire':
-    
+    # dataset = HeterophilousGraphDataset(root='../data/', name='roman-empire')
     preProcDs = HeterophilousGraphDataset(root='../data/', name='roman-empire')
     dataset = HeterophilousGraphDataset(root='../data/', name='roman-empire')
     data = dataset[0]
@@ -100,15 +104,16 @@ elif args.dataset_name in {'ogbn-arxiv', 'ogbn-products'}:
     dataset = PygNodePropPredDataset(name=args.dataset_name, root='../data/')
     data = dataset[0]
     data = transform(data)
+    # dataset = PygNodePropPredDataset(name=args.dataset_name, root='../data/')
+    # data = dataset[0]
     split_idx = dataset.get_idx_split()
-    data.train_mask = index_to_mask(split_idx['train'], data.num_nodes)
-    data.val_mask = index_to_mask(split_idx['valid'], data.num_nodes)
-    data.test_mask = index_to_mask(split_idx['test'], data.num_nodes)
+    data.train_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
+    data.train_mask[split_idx['train']] = True
+    data.val_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
+    data.val_mask[split_idx['valid']] = True
+    data.test_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
+    data.test_mask[split_idx['test']] = True
     data.y = data.y.squeeze()
-    data.edge_index = to_undirected(data.edge_index)
-    data.edge_index, _ = remove_self_loops(data.edge_index)
-    data.edge_index, _ = add_self_loops(data.edge_index, num_nodes=data.num_nodes)
-    
 else:
     preProcDs = WikipediaNetwork(
             root='../data/', name=args.dataset_name, geom_gcn_preprocess=False)#, transform=T.NormalizeFeatures())
@@ -122,47 +127,81 @@ else:
     data = random_planetoid_splits(data, dataset.num_classes, percls_trn, val_lb)
 
 
+image_dataloader_three = ScalableSubgraphDataset(
+        edge_index=data.edge_index, 
+        num_nodes=data.num_nodes, 
+        k_hops=3,          # Look 3 steps out
+        matrix_size=512    # Output is always 512x512
+)
+
+image_dataloader_two = ScalableSubgraphDataset(
+        edge_index=data.edge_index, 
+        num_nodes=data.num_nodes, 
+        k_hops=2,          # Look 2 steps out
+        matrix_size=512    # Output is always 512x512
+)
+
+image_dataloader_one = ScalableSubgraphDataset(
+        edge_index=data.edge_index, 
+        num_nodes=data.num_nodes, 
+        k_hops=1,          # Look 1 step out
+        matrix_size=512    # Output is always 512x512
+)
+
+resnet = models.resnet50(pretrained=True)
+resnet.fc = nn.Identity()  # remove final classifier
+resnet = resnet.cuda()
 
 try:
-    graphon_list = torch.load(save_file)
-except FileNotFoundError:
-    graphon_list = make_adj_to_graphon(data.edge_index, data.num_nodes, hops, img_size, save_file=save_file)
-    
+    embedding = torch.load(f'./graphon/{args.dataset_name}_resnet50.pt')
+    embedding = torch.load(f'./graphon/{args.dataset_name}_resnet5000.pt')
+except:
+    embedding = None
+    # graphon_list = make_adj_to_graphon_random(data.edge_index, data.num_nodes, hops, img_size, save_file=save_file)
+    loader_one = DataLoader(image_dataloader_one, batch_size=128, shuffle=False, num_workers=32) # set num_workers > 0 on Linux
+    loader_two = DataLoader(image_dataloader_two, batch_size=128, shuffle=False, num_workers=32) # set num_workers > 0 on Linux
+    loader_three = DataLoader(image_dataloader_three, batch_size=128, shuffle=False, num_workers=32) # set num_workers > 0 on Linux
 
+    total_batches = len(loader_one) 
 
-try:
-    embedding = torch.load(f'./graphon/{args.dataset_name}_embedding_dino.pt').cuda()
+    # Wrap the zip with tqdm
+    for batch_one, batch_two, batch_three in tqdm(zip(loader_one, loader_two, loader_three), total=total_batches, desc="Extracting Features"):
+        
+        batch_one = batch_one.cuda()
+        batch_two = batch_two.cuda()
+        batch_three = batch_three.cuda()
+        
+        with torch.no_grad():
+            # Expand 1-channel input to 3-channel for ResNet (1, H, W) -> (3, H, W)
+            img_embed_one = resnet(batch_one.expand(-1, 3, -1, -1))
+            img_embed_two = resnet(batch_two.expand(-1, 3, -1, -1))
+            img_embed_three = resnet(batch_three.expand(-1, 3, -1, -1))
+            
+            # Concatenate features
+            img_embed = torch.stack([img_embed_one, img_embed_two, img_embed_three], dim=1)
+            
+            # Accumulate results
+            # NOTE: Keeping this on GPU might cause Out Of Memory (OOM) for large datasets.
+            # Consider .cpu() if you crash.
+            if embedding is None:
+                embedding = img_embed.cpu() # Recommended: Move to CPU immediately
+            else:
+                embedding = torch.cat([embedding, img_embed.cpu()], dim=0)
+                
+
     fan_in = embedding.shape[-1]
     fan_out = embedding.shape[-1]  # you can adjust depending on how you interpret the dims
     limit = (6 / (fan_in + fan_out)) ** 0.5  # Xavier uniform bound
+
+    # apply Xavier uniform initialization
     embedding.uniform_(-limit, limit)
     torch.nn.init.orthogonal_(embedding, gain=0.5)
-except FileNotFoundError:
-    resnet = models.resnet50(pretrained=True)
-    resnet.fc = nn.Identity()  # remove final classifier
-    resnet = resnet.cuda()
-    graphon_list = graphon_list.reshape(-1, 1, graphon_list.shape[-1], graphon_list.shape[-1])
-    graphon_list = graphon_list.expand(-1, 3, -1, -1)
-    embedding = pretrained_embed(graphon_list, resnet)
-    embedding = embedding.reshape(-1, 3, embedding.shape[-1])
-
-    torch.save(embedding.cpu(), f'./graphon/{args.dataset_name}_embedding.pt')
-    # resnet = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")
-    # # resnet.fc = nn.Identity()  # remove final classifier
-    # resnet = resnet.cuda()
-    # graphon_list = graphon_list.reshape(-1, 1, graphon_list.shape[-1], graphon_list.shape[-1])
-    # graphon_list = graphon_list.expand(-1, 3, -1, -1)
-
-    # mask = torch.rand_like(graphon_list) > 0.1
-    # # graphon_list = graphon_list * mask
-
-    # # change image into 224 * 224 (in case of dino)
-    # graphon_list = torch.nn.functional.interpolate(graphon_list, size=(224, 224), mode='bilinear', align_corners=False)
+    embedding = embedding.cuda()
+    torch.save(embedding, f'./graphon/{args.dataset_name}_resnet50.pt')
+# print(embedding.shape)
+# exit(0)
 
 
-    # embedding = pretrained_embed(graphon_list, resnet)
-    # embedding = embedding.reshape(-1, 3, embedding.shape[-1])
-    # torch.save(embedding.cpu(), f'./graphon/{args.dataset_name}_embedding_dino.pt')
 
 
 if args.missing_rate == 1:
@@ -212,27 +251,26 @@ elif args.missing_rate == 2:
 
 ##### Train model
 data = data.cuda()
+                    ### input_dim, class_dim, embed_dim, num_layers, num_heads, mlp_dim, dropout=0.1
 
-my_model = MyModel_without_VQ_Gate_Mix(data.num_features, int(max(data.y))+1, args.embed_dim, args.num_layers, args.num_heads, args.mlp_dim, args.dropout, image_dim=embedding.shape[-1], img_embed_num=args.img_embed_num) # later change it into parse (Citeseer) # Current Best
-if dataset_name in {'ogbn-arxiv', 'ogbn-products'}:
-    my_model = MyModel_without_VQ_Gate_Mix_Large(data.num_features, int(max(data.y))+1, args.embed_dim, args.num_layers, args.num_heads, args.mlp_dim, args.dropout, image_dim=embedding.shape[-1], img_embed_num=args.img_embed_num) # later change it into parse (Citeseer) # Current Best
-elif dataset_name in {'squirrel', 'chameleon' }:
-    my_model = MyModel_with_VQ_Hetero_squirrel(data.num_features, int(max(data.y))+1, args.embed_dim, args.num_layers, args.num_heads, args.mlp_dim, args.dropout, image_dim=embedding.shape[-1], img_embed_num=args.img_embed_num) # later change it into parse (Citeseer) # Current Best
+# my_model = MyModel(data.num_features, int(max(data.y))+1, 128, 4, 16, 256, 0.5) # later change it into parse (Cora)
+my_model = MyModel_large_KDD(data.num_features, int(max(data.y))+1, args.embed_dim, args.num_layers, args.num_heads, args.mlp_dim, args.dropout, image_dim=embedding.shape[-1], img_embed_num=args.img_embed_num) # later change it into parse (Citeseer) # Current Best
+# my_model = MyModel_large_KDD_squirrel(data.num_features, int(max(data.y))+1, args.embed_dim, args.num_layers, args.num_heads, args.mlp_dim, args.dropout, image_dim=embedding.shape[-1], img_embed_num=args.img_embed_num) # later change it into parse (Citeseer) # Current Best
 my_model = my_model.cuda()
 
-
+# optimizer = torch.optim.Adam(my_model.parameters(), lr=args.lr, weight_decay=5e-4) #(Cora, CIteseer)
 optimizer = torch.optim.Adam(my_model.parameters(), lr=args.lr, weight_decay=5e-4) #(Cora, CIteseer)
+# optimizer = torch.optim.Adam(my_model.parameters(), lr=args.lr, weight_decay=5e-4) #(Cora, CIteseer)
+# optimizer = torch.optim.Adam(my_model.parameters(), lr=0.0002, weight_decay=2e-3) # Pubmed
 criterion = nn.CrossEntropyLoss()
 
-
-best_val_acc = 0
 best_acc = 0
 
 my_model.train()
 for epoch in range(3000):
+# for epoch in range(1000):
     optimizer.zero_grad()
     out = my_model(data.x, data.edge_index, embedding)
-
     loss = criterion(out[data.train_mask], data.y[data.train_mask])
     loss.backward()
     optimizer.step()
@@ -247,20 +285,15 @@ for epoch in range(3000):
         with torch.no_grad():
             out = my_model(data.x, data.edge_index, embedding)
             pred = out.argmax(dim=1)
-            correct = pred[data.valid_mask] == data.y[data.valid_mask]
-            test_acc = int(correct.sum()) / int(data.valid_mask.sum())
+            correct = pred[data.test_mask] == data.y[data.test_mask]
+            test_acc = int(correct.sum()) / int(data.test_mask.sum())
             # img_label = my_model.get_img_label(embedding).reshape(-1)
             # print(torch.bincount(img_label), img_label[:3])
             print(f'Test Accuracy: {test_acc:.4f}')
-            if test_acc >= best_val_acc:
-                best_val_acc = test_acc
-                out = my_model(data.x, data.edge_index, embedding)
-                pred = out.argmax(dim=1)
-                correct = pred[data.test_mask] == data.y[data.test_mask]
-                test_acc = int(correct.sum()) / int(data.test_mask.sum())
+            if test_acc >= best_acc:
                 best_acc = test_acc
         my_model.train()
 
-# with open(f'./results/{args.dataset_name}__{args.missing_rate}.txt', 'a') as f:
-#     f.write(f'embed_dim: {args.embed_dim}, num_layers: {args.num_layers}, num_heads: {args.num_heads}, mlp_dim: {args.mlp_dim}, dropout: {args.dropout}, lr: {args.lr}, img_embed_num: {args.img_embed_num}, best_acc: {best_acc}\n')
+with open(f'./results/{args.dataset_name}_gate_new_mix_{args.missing_rate}_ICML.txt', 'a') as f:
+    f.write(f'embed_dim: {args.embed_dim}, num_layers: {args.num_layers}, num_heads: {args.num_heads}, mlp_dim: {args.mlp_dim}, dropout: {args.dropout}, lr: {args.lr}, img_embed_num: {args.img_embed_num}, best_acc: {best_acc}\n')
 
