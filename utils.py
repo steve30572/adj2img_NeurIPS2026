@@ -1,13 +1,12 @@
-from collections import Counter
+from collections import Counter, deque
 import torch
 import torch_geometric
 import networkx as nx
-from torch_geometric.utils import k_hop_subgraph
 from torch_sparse import SparseTensor
 import torch.nn.functional as F
 import time
 import tqdm
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, Dataset
 from torch_geometric.utils import to_networkx
 import os
 import torchvision.models as models
@@ -15,18 +14,359 @@ import torch.nn as nn
 from torch_geometric.loader import NeighborLoader
 
 from torch_geometric.datasets import Planetoid, TUDataset
-from torch_geometric.utils import add_self_loops, remove_self_loops, to_undirected, degree
+from torch_geometric.utils import add_self_loops, remove_self_loops, to_undirected, degree, k_hop_subgraph
 
 
 import matplotlib.pyplot as plt
 
 import random
 import numpy as np
-import torch
-import torch.nn.functional as F
+
+from torch_geometric.nn import MessagePassing
+
+class ScalableSubgraphDataset_order(Dataset):
+    def __init__(self, edge_index, num_nodes, k_hops=2, matrix_size=512):
+        """
+        Args:
+            edge_index (LongTensor): Graph connectivity (2, E).
+            num_nodes (int): Total number of nodes.
+            k_hops (int): Depth of subgraph.
+            matrix_size (int): Fixed output size (N x N).
+        """
+        self.edge_index = edge_index
+        self.num_nodes = num_nodes
+        self.k_hops = k_hops
+        self.matrix_size = matrix_size
+        
+        # Pre-compute degrees for stable sorting (tie-breaking)
+        # Using CPU for pre-computation to save GPU memory
+        print("Pre-computing node degrees for canonical sorting...")
+        self.node_degrees = degree(edge_index[0], num_nodes).long()
+
+    def __len__(self):
+        return self.num_nodes
+
+    def __getitem__(self, idx):
+        # --- STEP 1: Fast Sparse Extraction ---
+        # subset: Node IDs in the subgraph
+        # sub_edge_index: Edges between these nodes (original IDs)
+        # mapping: The index of the center node inside 'subset'
+        subset, sub_edge_index, mapping, _ = k_hop_subgraph(
+            node_idx=idx, 
+            num_hops=self.k_hops, 
+            edge_index=self.edge_index, 
+            relabel_nodes=True 
+        )
+        
+        num_sub_nodes = subset.size(0)
+
+        # --- STEP 2: Canonical Sorting (BFS + Degree) ---
+        # We must reorder nodes so the Center is at 0, and neighbors are clustered.
+        # This makes the matrix rotation-invariant.
+        sorted_indices = self._get_canonical_order(sub_edge_index, mapping.item(), num_sub_nodes, subset)
+        
+        # Map old local indices (0..M) to new sorted indices (0..M)
+        # We need to permute the edge_index to match this new order.
+        # Create a mapping: old_index -> new_sorted_index
+        old_to_new = torch.empty(num_sub_nodes, dtype=torch.long, device=self.edge_index.device)
+        old_to_new[torch.arange(num_sub_nodes, device=self.edge_index.device)] = torch.arange(num_sub_nodes, device=self.edge_index.device)
+        
+        # Apply mapping to edges
+        sorted_sub_edge_index = old_to_new[sub_edge_index]
+
+        # --- STEP 3: Scalable Matrix Generation (Sparse Binning) ---
+        # This function generates the 512x512 matrix without crashing RAM.
+        final_matrix = self._sparse_to_fixed_matrix(
+            sorted_sub_edge_index, 
+            num_sub_nodes, 
+            self.matrix_size
+        )
+
+        # Add channel dimension: (1, 512, 512)
+        return final_matrix.unsqueeze(0)
+
+    def _sparse_to_fixed_matrix(self, edge_index, num_sub_nodes, target_size):
+        """
+        Maps edges to pixels directly using binning. O(E) complexity.
+        Equivalent to Average Pooling but skips the dense matrix step.
+        """
+        # If subgraph is small, use standard dense padding (faster for small N)
+        if num_sub_nodes <= target_size:
+            from torch_geometric.utils import to_dense_adj
+            adj = to_dense_adj(edge_index, max_num_nodes=num_sub_nodes)[0]
+            # print("to_dense_adj to : ")
+            # Pad to target_size
+            pad_amt = target_size - num_sub_nodes
+            return F.pad(adj, (0, pad_amt, 0, pad_amt), "constant", 0)
+
+        # --- SPARSE BINNING (For Large Graphs) ---
+        
+        # 1. Determine Scale: How many nodes fit into one pixel?
+        # e.g. 1024 nodes -> 512 pixels. Scale = 0.5
+        scale = target_size / num_sub_nodes
+        
+        row, col = edge_index
+        
+        # 2. Map Edge Coordinates to Pixel Buckets
+        # floor( node_idx * scale ) gives the pixel index
+        bucket_row = (row.float() * scale).long().clamp(max=target_size-1)
+        bucket_col = (col.float() * scale).long().clamp(max=target_size-1)
+        
+        # 3. Flatten to 1D indices for efficient accumulation
+        flat_indices = bucket_row * target_size + bucket_col
+        
+        # 4. Accumulate Edges (Scatter Add)
+        # Create a flat canvas
+        canvas = torch.zeros(target_size * target_size, device=edge_index.device)
+        
+        # 'put_' adds 1.0 to the specific indices, accumulating duplicates
+        # value=1.0 represents the existence of an edge
+        values = torch.ones_like(flat_indices, dtype=torch.float)
+        canvas.index_put_((flat_indices,), values, accumulate=True)
+        
+        # 5. Normalize (Average Pooling Math)
+        # We need to divide by the area of the "node block" that formed this pixel.
+        # Block Width = 1 / scale
+        # Area = Width * Width
+        area_norm = (1.0 / scale) ** 2
+        canvas = canvas / area_norm
+        
+        # 6. Reshape back to 2D
+        return canvas.view(target_size, target_size)
+
+    def _get_canonical_order(self, edge_index, center_idx, num_nodes, original_node_ids):
+        """
+        Sorts nodes by:
+        1. Distance from Center (BFS Layers)
+        2. Node Degree (Tie-breaker for rotational invariance)
+        """
+        # Build Adjacency List for fast traversal
+        adj = [[] for _ in range(num_nodes)]
+        src, dst = edge_index.tolist()
+        for s, d in zip(src, dst):
+            adj[s].append(d)
+        
+        # BFS to assign distances
+        distances = [-1] * num_nodes
+        distances[center_idx] = 0
+        queue = deque([center_idx])
+        
+        # Store nodes in buckets by distance: layers[0]=[center], layers[1]=[neighbors]...
+        layers = {} 
+        
+        while queue:
+            u = queue.popleft()
+            d = distances[u]
+            if d not in layers: layers[d] = []
+            layers[d].append(u)
+            
+            for v in adj[u]:
+                if distances[v] == -1:
+                    distances[v] = d + 1
+                    queue.append(v)
+        
+        # Collect nodes in order
+        sorted_nodes = []
+        
+        # For disconnected components (if any), assign infinite distance
+        # and add them at the end
+        visited_count = sum(len(l) for l in layers.values())
+        if visited_count < num_nodes:
+            remaining = [n for n in range(num_nodes) if distances[n] == -1]
+            layers[9999] = remaining
+
+        # Sort within layers by Degree (Descending) to ensure determinism
+        sorted_layer_keys = sorted(layers.keys())
+        for d in sorted_layer_keys:
+            nodes_in_layer = layers[d]
+            # Get degrees of these nodes from the global graph (better structural signal)
+            # We map local index -> global index -> get degree
+            global_ids = original_node_ids[nodes_in_layer]
+            deg_scores = self.node_degrees[global_ids]
+            
+            # Sort indices based on degree (descending), then index (for absolute ties)
+            # We zip (degree, node_idx) and sort
+            zipped = sorted(zip(deg_scores.tolist(), nodes_in_layer), key=lambda x: (-x[0], x[1]))
+            sorted_nodes.extend([n for _, n in zipped])
+            
+        return torch.tensor(sorted_nodes, dtype=torch.long, device=edge_index.device)
 
 
-import torch
+
+class ScalableSubgraphDataset(Dataset):
+    def __init__(self, edge_index, num_nodes, k_hops=2, matrix_size=512):
+        """
+        Args:
+            edge_index (LongTensor): Graph connectivity (2, E).
+            num_nodes (int): Total number of nodes.
+            k_hops (int): Depth of subgraph.
+            matrix_size (int): Fixed output size (N x N).
+        """
+        self.edge_index = edge_index
+        self.num_nodes = num_nodes
+        self.k_hops = k_hops
+        self.matrix_size = matrix_size
+        
+        # Pre-compute degrees for stable sorting (tie-breaking)
+        # Using CPU for pre-computation to save GPU memory
+        print("Pre-computing node degrees for canonical sorting...")
+        self.node_degrees = degree(edge_index[0], num_nodes).long()
+
+    def __len__(self):
+        return self.num_nodes
+
+    def __getitem__(self, idx):
+        # --- STEP 1: Fast Sparse Extraction ---
+        # subset: Node IDs in the subgraph
+        # sub_edge_index: Edges between these nodes (original IDs)
+        # mapping: The index of the center node inside 'subset'
+        subset, sub_edge_index, mapping, _ = k_hop_subgraph(
+            node_idx=idx, 
+            num_hops=self.k_hops, 
+            edge_index=self.edge_index, 
+            relabel_nodes=True 
+        )
+        
+        num_sub_nodes = subset.size(0)
+
+        # --- STEP 2: Canonical Sorting (BFS + Degree) ---
+        # We must reorder nodes so the Center is at 0, and neighbors are clustered.
+        # This makes the matrix rotation-invariant.
+        sorted_indices = self._get_canonical_order(sub_edge_index, mapping.item(), num_sub_nodes, subset)
+        
+        # Map old local indices (0..M) to new sorted indices (0..M)
+        # We need to permute the edge_index to match this new order.
+        # Create a mapping: old_index -> new_sorted_index
+        old_to_new = torch.empty(num_sub_nodes, dtype=torch.long, device=self.edge_index.device)
+        old_to_new[sorted_indices] = torch.arange(num_sub_nodes, device=self.edge_index.device)
+        
+        # Apply mapping to edges
+        sorted_sub_edge_index = old_to_new[sub_edge_index]
+
+        # --- STEP 3: Scalable Matrix Generation (Sparse Binning) ---
+        # This function generates the 512x512 matrix without crashing RAM.
+        final_matrix = self._sparse_to_fixed_matrix(
+            sorted_sub_edge_index, 
+            num_sub_nodes, 
+            self.matrix_size
+        )
+
+        # Add channel dimension: (1, 512, 512)
+        return final_matrix.unsqueeze(0)
+
+    def _sparse_to_fixed_matrix(self, edge_index, num_sub_nodes, target_size):
+        """
+        Maps edges to pixels directly using binning. O(E) complexity.
+        Equivalent to Average Pooling but skips the dense matrix step.
+        """
+        # If subgraph is small, use standard dense padding (faster for small N)
+        if num_sub_nodes <= target_size:
+            from torch_geometric.utils import to_dense_adj
+            adj = to_dense_adj(edge_index, max_num_nodes=num_sub_nodes)[0]
+            # print("to_dense_adj to : ")
+            # Pad to target_size
+            pad_amt = target_size - num_sub_nodes
+            return F.pad(adj, (0, pad_amt, 0, pad_amt), "constant", 0)
+
+        # --- SPARSE BINNING (For Large Graphs) ---
+        
+        # 1. Determine Scale: How many nodes fit into one pixel?
+        # e.g. 1024 nodes -> 512 pixels. Scale = 0.5
+        scale = target_size / num_sub_nodes
+        
+        row, col = edge_index
+        
+        # 2. Map Edge Coordinates to Pixel Buckets
+        # floor( node_idx * scale ) gives the pixel index
+        bucket_row = (row.float() * scale).long().clamp(max=target_size-1)
+        bucket_col = (col.float() * scale).long().clamp(max=target_size-1)
+        
+        # 3. Flatten to 1D indices for efficient accumulation
+        flat_indices = bucket_row * target_size + bucket_col
+        
+        # 4. Accumulate Edges (Scatter Add)
+        # Create a flat canvas
+        canvas = torch.zeros(target_size * target_size, device=edge_index.device)
+        
+        # 'put_' adds 1.0 to the specific indices, accumulating duplicates
+        # value=1.0 represents the existence of an edge
+        values = torch.ones_like(flat_indices, dtype=torch.float)
+        canvas.index_put_((flat_indices,), values, accumulate=True)
+        
+        # 5. Normalize (Average Pooling Math)
+        # We need to divide by the area of the "node block" that formed this pixel.
+        # Block Width = 1 / scale
+        # Area = Width * Width
+        area_norm = (1.0 / scale) ** 2
+        canvas = canvas / area_norm
+        
+        # 6. Reshape back to 2D
+        return canvas.view(target_size, target_size)
+
+    def _get_canonical_order(self, edge_index, center_idx, num_nodes, original_node_ids):
+        """
+        Sorts nodes by:
+        1. Distance from Center (BFS Layers)
+        2. Node Degree (Tie-breaker for rotational invariance)
+        """
+        # Build Adjacency List for fast traversal
+        adj = [[] for _ in range(num_nodes)]
+        src, dst = edge_index.tolist()
+        for s, d in zip(src, dst):
+            adj[s].append(d)
+        
+        # BFS to assign distances
+        distances = [-1] * num_nodes
+        distances[center_idx] = 0
+        queue = deque([center_idx])
+        
+        # Store nodes in buckets by distance: layers[0]=[center], layers[1]=[neighbors]...
+        layers = {} 
+        
+        while queue:
+            u = queue.popleft()
+            d = distances[u]
+            if d not in layers: layers[d] = []
+            layers[d].append(u)
+            
+            for v in adj[u]:
+                if distances[v] == -1:
+                    distances[v] = d + 1
+                    queue.append(v)
+        
+        # Collect nodes in order
+        sorted_nodes = []
+        
+        # For disconnected components (if any), assign infinite distance
+        # and add them at the end
+        visited_count = sum(len(l) for l in layers.values())
+        if visited_count < num_nodes:
+            remaining = [n for n in range(num_nodes) if distances[n] == -1]
+            layers[9999] = remaining
+
+        # Sort within layers by Degree (Descending) to ensure determinism
+        sorted_layer_keys = sorted(layers.keys())
+        for d in sorted_layer_keys:
+            nodes_in_layer = layers[d]
+            # Get degrees of these nodes from the global graph (better structural signal)
+            # We map local index -> global index -> get degree
+            global_ids = original_node_ids[nodes_in_layer]
+            deg_scores = self.node_degrees[global_ids]
+            
+            # Sort indices based on degree (descending), then index (for absolute ties)
+            # We zip (degree, node_idx) and sort
+            zipped = sorted(zip(deg_scores.tolist(), nodes_in_layer), key=lambda x: (-x[0], x[1]))
+            sorted_nodes.extend([n for _, n in zipped])
+            
+        return torch.tensor(sorted_nodes, dtype=torch.long, device=edge_index.device)
+
+
+class MeanAggregator(MessagePassing):
+    def forward(self, x, edge_index):
+        return self.propagate(edge_index, x=x)
+
+    def message(self, x_j):
+        return x_j
 
 
 def index_to_mask(index, size):
@@ -122,6 +462,58 @@ def convert_2_graphon(dense_adj, size):
         x_down = x_down.squeeze(0).squeeze(0)  # Remove batch and channel dimensions
         return x_down
 
+#########
+def make_adj_to_graphon(edge_index, num_nodes, hops, img_size, save_file='./graphon/cora.pt'):
+    graphon_list = []
+    for i in tqdm.tqdm(range(0, num_nodes, 1), desc="Processing nodes"):
+        for j in range(hops):
+            node_subset, sub_edge_index, mapping, edge_mask = extract_k_hop(edge_index, i, j+1, num_nodes=num_nodes)
+            degree_set = get_degree_set(sub_edge_index, num_nodes=len(node_subset))
+            degree_tensor = torch.tensor(degree_set, device=sub_edge_index.device)
+            _, sorted_indices = torch.sort(degree_tensor, descending=True)
+            sub_dense_adj = edge_index_to_dense(sub_edge_index, num_nodes=len(node_subset))
+
+            sub_dense_adj = sub_dense_adj[sorted_indices, :][:, sorted_indices]
+
+            graphon = convert_2_graphon(sub_dense_adj, size=img_size)
+            graphon_list.append(graphon)
+    graphon_list = torch.stack(graphon_list)
+    graphon_list = graphon_list.reshape(num_nodes, hops, img_size, img_size)
+    print(graphon_list.shape)
+    torch.save(graphon_list, save_file)
+    return graphon_list
+########
+
+def make_adj_to_graphon_aggregate(edge_index, num_nodes, hops, img_size, batch_size=512, device='cpu', save_file='./graphon/cora.pt'):
+    from bit_calc import DecomposableEncoding
+    graphon_list = []
+
+    aggregator = MeanAggregator().to(device) 
+    
+    # initialize 10-bit one-hot node features repeated to cover all nodes
+    encoder = DecomposableEncoding(
+        num_items=num_nodes,
+        bits_per_slot=32
+    )
+    node_feature = torch.tensor(encoder.encode_batch(list(range(num_nodes))), device=device, dtype=torch.float32)
+
+    for j in range(1, hops+1):
+        node_feature = aggregator(node_feature, edge_index.to(device))
+        for i in tqdm.tqdm(range(0, num_nodes, 1), desc="Processing nodes"):
+            subset_node = torch.nonzero(node_feature[i]).squeeze().to(device)
+            sub_edge_index, _ = torch_geometric.utils.subgraph(subset_node, edge_index.to(device), relabel_nodes=True)
+            degree_set = get_degree_set(sub_edge_index, num_nodes=len(subset_node))
+            degree_tensor = torch.tensor(degree_set, device=sub_edge_index.device)
+            _, sorted_indices = torch.sort(degree_tensor, descending=True)
+            sub_dense_adj = edge_index_to_dense(sub_edge_index, num_nodes=len(subset_node)) 
+            sub_dense_adj = sub_dense_adj[sorted_indices, :][:, sorted_indices]
+            graphon = convert_2_graphon(sub_dense_adj, size=img_size)
+            graphon_list.append(graphon)
+    graphon_list = torch.stack(graphon_list)
+    graphon_list = graphon_list.reshape(num_nodes, hops, img_size, img_size)
+    print(graphon_list.shape)
+
+
 def make_adj_to_graphon_scale(edge_index, num_nodes, hops, img_size, batch_size=512, device='cpu', save_file='./graphon/cora.pt'):
     graphon_list = []
 
@@ -214,6 +606,26 @@ def make_adj_to_graphon(edge_index, num_nodes, hops, img_size, save_file='./grap
             sub_dense_adj = edge_index_to_dense(sub_edge_index, num_nodes=len(node_subset))
 
             sub_dense_adj = sub_dense_adj[sorted_indices, :][:, sorted_indices]
+
+            graphon = convert_2_graphon(sub_dense_adj, size=img_size)
+            graphon_list.append(graphon)
+    graphon_list = torch.stack(graphon_list)
+    graphon_list = graphon_list.reshape(num_nodes, hops, img_size, img_size)
+    print(graphon_list.shape)
+    torch.save(graphon_list, save_file)
+    return graphon_list
+
+def make_adj_to_graphon_random(edge_index, num_nodes, hops, img_size, save_file='./graphon/cora_random.pt'):
+    graphon_list = []
+    for i in tqdm.tqdm(range(0, num_nodes, 1), desc="Processing nodes"):
+        for j in range(hops):
+            node_subset, sub_edge_index, mapping, edge_mask = extract_k_hop(edge_index, i, j+1, num_nodes=num_nodes)
+            degree_set = get_degree_set(sub_edge_index, num_nodes=len(node_subset))
+            degree_tensor = torch.tensor(degree_set, device=sub_edge_index.device)
+            # _, sorted_indices = torch.sort(degree_tensor, descending=True)
+            sub_dense_adj = edge_index_to_dense(sub_edge_index, num_nodes=len(node_subset))
+
+            sub_dense_adj = sub_dense_adj#[degree_tensor, :][:, degree_tensor]
 
             graphon = convert_2_graphon(sub_dense_adj, size=img_size)
             graphon_list.append(graphon)
