@@ -149,7 +149,7 @@ class SimpleGAT(nn.Module):
     def forward(self, x, edge_index):
         # x, edge_index = data.x, data.edge_index
         x = self.conv1(x, edge_index)
-        x = F.elu(x)
+        x = F.relu(x)
         x = F.dropout(x, p=0.5, training=self.training)
         x = self.conv2(x, edge_index)
         return x
@@ -160,8 +160,8 @@ class SimpleGCN(nn.Module):
         self.conv1 = torch_geometric.nn.GCNConv(input_dim, hidden_dim)
         self.conv2 = torch_geometric.nn.GCNConv(hidden_dim, output_dim)
 
-    def forward(self, data):
-        x, edge_index = data.x, data.edge_index
+    def forward(self, x, edge_index):
+        # x, edge_index = data.x, data.edge_index
         x = self.conv1(x, edge_index)
         x = F.relu(x)
         x = F.dropout(x, p=0.5, training=self.training)
@@ -275,6 +275,14 @@ class Transformer(nn.Module):
                 return x
             x = layer(x)
         return x
+
+
+class MeanAggregator(MessagePassing):
+    def forward(self, x, edge_index):
+        return self.propagate(edge_index, x=x)
+
+    def message(self, x_j):
+        return x_j
 
 class SimpleAggregator(MessagePassing):
     def __init__(self, aggr='mean'):
@@ -1755,3 +1763,748 @@ class WeightedAggregator(MessagePassing):
     def message(self, x_j, edge_weight):
         # Message from neighbor j → i is scaled by edge weight
         return edge_weight.unsqueeze(-1) * x_j
+
+
+
+
+### For the large dataset (KDD)
+
+class MyModel_large_KDD(nn.Module):
+    def __init__(self, input_dim, class_dim, embed_dim, num_layers, num_heads, mlp_dim, dropout=0.1, image_dim=2048, img_embed_num=256):
+        super().__init__()
+        self.aggregator = SimpleAggregator()
+        self.aggregator1 = torch_geometric.nn.GCNConv(embed_dim, embed_dim)
+        self.aggregator2 = torch_geometric.nn.GCNConv(embed_dim, embed_dim)
+        self.aggregator3 = torch_geometric.nn.GCNConv(embed_dim, embed_dim)
+        self.transformer = Transformer(embed_dim, num_layers, num_heads, mlp_dim, dropout)
+        self.input_proj = nn.Linear(input_dim, embed_dim)
+        self.input_proj_img1 = nn.Linear(image_dim, embed_dim)
+        self.input_proj_img2 = nn.Linear(embed_dim, img_embed_num)
+        self.img_embed = nn.Embedding(img_embed_num, embed_dim)
+        self.output_proj = nn.Linear(embed_dim, class_dim)
+        self.dropout = dropout
+        self.token_representation = nn.Parameter(torch.randn(1, embed_dim))
+        self.type_emb = nn.Embedding(2, embed_dim)
+        self.hop_emb = nn.Embedding(3, embed_dim)
+        # self.prefix_token = nn.Embedding(10, embed_dim)
+
+        # self.check_gcn1 = torch_geometric.nn.GCNConv(input_dim, embed_dim)
+        # self.check_gcn2 = torch_geometric.nn.GCNConv(embed_dim, class_dim)
+
+    def get_img_label(self, img):
+        img = self.input_proj_img1(img)
+        img = F.relu(img)
+        img = self.input_proj_img2(img)
+        # img_y = torch.nn.functional.softmax(img, dim=-1)
+
+        img_y = img
+
+        
+        # img_y = torch.nn.functional.gumbel_softmax(img, tau=1, hard=True)
+        # print(img_y[0,0], img_y[200,0])
+        # print("*" * 20)
+        img_z = img_y.argmax(dim=-1)
+        return img_z
+
+        # img_embed = self.img_embed(img_z)
+        # x = self.output_proj(img_embed.squeeze(1))
+        # return x.argmax(dim=-1)
+    
+    def forward(self, x, edge_index, img):
+        # token_representation = self.token_representation.expand(x.size(0), -1)
+        # x = self.check_gcn1(x, edge_index)
+        # x = F.relu(x)
+        # x = F.dropout(x, p=0.5, training=self.training)
+        # x = self.check_gcn2(x, edge_index)
+        # return x
+
+
+
+        x = self.input_proj(x)
+
+        ## making image embedding with dataloaders
+
+
+        img = self.input_proj_img1(img)
+        img = F.relu(img)
+        img = self.input_proj_img2(img)
+
+        ### Softmax added
+        # img = F.softmax(img, dim=-1)
+
+        img_embed = torch.matmul(img, self.img_embed.weight)
+        
+        x_2_agg = self.aggregator(x, edge_index)
+        x_3_agg = self.aggregator(x_2_agg, edge_index)
+        x_4_agg = self.aggregator(x_3_agg, edge_index)
+        
+
+        x_2 = self.aggregator1(x, edge_index)
+        x_3 = self.aggregator2(x_2, edge_index)
+        x_4 = self.aggregator3(x_3, edge_index)
+        
+        
+        # img_embed += self.type_emb(torch.ones((img_embed.size(0), img_embed.size(1)), dtype=torch.long, device=img_embed.device))
+
+        # x_input = torch.stack((x_3, x_2_agg, x_3_agg), dim=1) # token_representation, 
+        # x_input = torch.stack((x_4, x_2_agg, x_3_agg, x_4_agg), dim=1) # token_representation, 
+        x_input = torch.stack((x_4, x_2, x_3, x), dim=1) # token_representation, 
+        
+        # return x_3
+        # x = self.transformer(x_input)
+        # return x[:, 0]
+
+
+        x_input = torch.cat((x_input, img_embed), dim=1)
+        # x_input = img_embed
+        x = self.transformer(x_input)
+
+        ### Gating
+
+        x = self.output_proj(x)
+        gate = torch.sigmoid(x[:, 0])
+        x = x[:, 0] * gate + (1 - gate) * x[:, -1]
+        return x
+
+    def median_act(self, x, edge_index, img, target):
+        x = self.input_proj(x)
+        # x = F.relu(x)
+        # x = F.dropout(x, p=0.2, training=self.training)
+        img = self.input_proj_img(img)
+        img_y = torch.nn.functional.gumbel_softmax(img, tau=1, hard=True)
+        img_z = img_y.argmax(dim=-1)
+        img_embed = self.img_embed(img_z)
+
+        x_2 = self.aggregator(x, edge_index)
+        x_3 = self.aggregator(x_2, edge_index)
+        x_4 = self.aggregator(x_3, edge_index)
+        # x_5 = self.aggregator(x_4, edge_index)
+        # x_input = torch.stack((x, x_2), dim=1)
+        # x_input = torch.stack((x, x_2, x_3), dim=1)
+
+        x_2 += self.type_emb(torch.zeros(x_2.size(0), dtype=torch.long, device=x_2.device))
+        x_3 += self.type_emb(torch.zeros(x_3.size(0), dtype=torch.long, device=x_3.device))
+        x_4 += self.type_emb(torch.zeros(x_4.size(0), dtype=torch.long, device=x_4.device))
+        img_embed += self.type_emb(torch.ones(img_embed.size(0), dtype=torch.long, device=img_embed.device))
+
+        x_input = torch.stack((x, x_2, x_3, x_4), dim=1)
+        x_input = torch.cat((x_input, img_embed), dim=1)
+        x = self.transformer.median_act(x_input, target)
+        x = self.output_proj(x)
+        return x
+
+
+class MyModel_large_KDD_diff(nn.Module):
+    def __init__(self, input_dim, class_dim, embed_dim, num_layers, num_heads, mlp_dim, model_name, dropout=0.1, image_dim=2048, img_embed_num=256):
+        super().__init__()
+        self.aggregator = SimpleAggregator()
+
+        self.model_name = model_name
+        if model_name == 'gcn':
+            self.aggregator1 = torch_geometric.nn.GCNConv(embed_dim, embed_dim)
+            self.aggregator2 = torch_geometric.nn.GCNConv(embed_dim, embed_dim)
+            self.aggregator3 = torch_geometric.nn.GCNConv(embed_dim, embed_dim)
+        elif model_name == 'sage':
+            self.aggregator1 = torch_geometric.nn.SAGEConv(embed_dim, embed_dim)
+            self.aggregator2 = torch_geometric.nn.SAGEConv(embed_dim, embed_dim)
+            self.aggregator3 = torch_geometric.nn.SAGEConv(embed_dim, embed_dim)
+        elif model_name == 'gat':
+            self.aggregator1 = torch_geometric.nn.GATConv(embed_dim, embed_dim//4, heads=4)
+            self.aggregator2 = torch_geometric.nn.GATConv(embed_dim, embed_dim//4, heads=4)
+            self.aggregator3 = torch_geometric.nn.GATConv(embed_dim, embed_dim//4, heads=4)
+        self.transformer = Transformer(embed_dim, num_layers, num_heads, mlp_dim, dropout)
+        self.input_proj = nn.Linear(input_dim, embed_dim)
+        self.input_proj_img1 = nn.Linear(image_dim, embed_dim)
+        self.input_proj_img2 = nn.Linear(embed_dim, img_embed_num)
+        self.img_embed = nn.Embedding(img_embed_num, embed_dim)
+        self.output_proj = nn.Linear(embed_dim, class_dim)
+        self.dropout = dropout
+        self.token_representation = nn.Parameter(torch.randn(1, embed_dim))
+        self.type_emb = nn.Embedding(2, embed_dim)
+        self.hop_emb = nn.Embedding(3, embed_dim)
+        # self.prefix_token = nn.Embedding(10, embed_dim)
+
+        # self.check_gcn1 = torch_geometric.nn.GCNConv(input_dim, embed_dim)
+        # self.check_gcn2 = torch_geometric.nn.GCNConv(embed_dim, class_dim)
+
+    def get_img_label(self, img):
+        img = self.input_proj_img1(img)
+        img = F.relu(img)
+        img = self.input_proj_img2(img)
+        # img_y = torch.nn.functional.softmax(img, dim=-1)
+
+        img_y = img
+
+        
+        # img_y = torch.nn.functional.gumbel_softmax(img, tau=1, hard=True)
+        # print(img_y[0,0], img_y[200,0])
+        # print("*" * 20)
+        img_z = img_y.argmax(dim=-1)
+        return img_z
+
+        # img_embed = self.img_embed(img_z)
+        # x = self.output_proj(img_embed.squeeze(1))
+        # return x.argmax(dim=-1)
+    
+    def forward(self, x, edge_index, img, mode='homo'):
+        # token_representation = self.token_representation.expand(x.size(0), -1)
+        # x = self.check_gcn1(x, edge_index)
+        # x = F.relu(x)
+        # x = F.dropout(x, p=0.5, training=self.training)
+        # x = self.check_gcn2(x, edge_index)
+        # return x
+
+
+
+        x = self.input_proj(x)
+
+        ## making image embedding with dataloaders
+
+        
+        if mode == 'homo':
+            img = self.input_proj_img1(img)
+            img = F.relu(img)
+            img = self.input_proj_img2(img)
+
+            ### Softmax added
+            # img = F.softmax(img, dim=-1)
+
+            img_embed = torch.matmul(img, self.img_embed.weight)
+
+        else:
+            img = self.input_proj_img1(img)
+            img = F.relu(img)
+            # img = F.dropout(img, p=0.2, training=self.training) ## added
+            img = self.input_proj_img2(img)
+            img_y = torch.nn.functional.gumbel_softmax(img, tau=1, hard=True)
+            img_z = img_y.argmax(dim=-1)
+            img_embed = self.img_embed(img_z)
+            # img_embed += self.type_emb(torch.ones((img_embed.size(0), img_embed.size(1)), dtype=torch.long, device=img_embed.device))
+
+        
+        
+        x_2_agg = self.aggregator(x, edge_index)
+        x_3_agg = self.aggregator(x_2_agg, edge_index)
+        # x_4_agg = self.aggregator(x_3_agg, edge_index)
+        
+
+        x_2 = self.aggregator1(x, edge_index)
+        x_2 = F.relu(x_2)
+        x_2 = F.dropout(x_2, p=0.5, training=self.training)
+        x_3 = self.aggregator2(x_2, edge_index)
+        # x_4 = self.aggregator3(x_3, edge_index)
+        
+        
+        img_embed += self.type_emb(torch.ones((img_embed.size(0), img_embed.size(1)), dtype=torch.long, device=img_embed.device))
+
+        # x_input = torch.stack((x_3, x_2_agg, x_3_agg), dim=1) # token_representation, 
+        # x_input = torch.stack((x_4, x_2_agg, x_3_agg, x_4_agg), dim=1) # token_representation, 
+        if mode == 'homo':
+            x_input = torch.stack((x_3, x_2_agg, x_3_agg), dim=1) # token_representation, 
+        else:
+            x_input = torch.stack((x_3, x_2_agg), dim=1) # token_representation, 
+        
+        # return x_3
+        # x = self.transformer(x_input)
+        # return x[:, -1]
+
+        # Normalize x_input and img_embed to have the same norm
+        
+        if self.model_name == 'sage':
+            
+            x_input = torch.nn.functional.normalize(x_input, p=2, dim=-1)
+            img_embed = torch.nn.functional.normalize(img_embed, p=2, dim=-1)
+        # print(f"x_input norm: {torch.sum(torch.norm(x_3, dim=-1))}, img_embed norm: {torch.sum(torch.norm(img_embed[:,2], dim=-1))}")
+        x_input = torch.cat((x_input, img_embed), dim=1)
+        # x_input = img_embed
+        x = self.transformer(x_input)
+        # return x[:, -1]
+        ### Gating
+
+        x = self.output_proj(x)
+        # return x[:, -1]
+        gate = torch.sigmoid(x[:, 0])
+        x = x[:, 0] * gate + (1 - gate) * x[:, -1]
+        return x
+
+    def median_act(self, x, edge_index, img, target):
+        x = self.input_proj(x)
+        # x = F.relu(x)
+        # x = F.dropout(x, p=0.2, training=self.training)
+        img = self.input_proj_img(img)
+        img_y = torch.nn.functional.gumbel_softmax(img, tau=1, hard=True)
+        img_z = img_y.argmax(dim=-1)
+        img_embed = self.img_embed(img_z)
+
+        x_2 = self.aggregator(x, edge_index)
+        x_3 = self.aggregator(x_2, edge_index)
+        x_4 = self.aggregator(x_3, edge_index)
+        # x_5 = self.aggregator(x_4, edge_index)
+        # x_input = torch.stack((x, x_2), dim=1)
+        # x_input = torch.stack((x, x_2, x_3), dim=1)
+
+        x_2 += self.type_emb(torch.zeros(x_2.size(0), dtype=torch.long, device=x_2.device))
+        x_3 += self.type_emb(torch.zeros(x_3.size(0), dtype=torch.long, device=x_3.device))
+        x_4 += self.type_emb(torch.zeros(x_4.size(0), dtype=torch.long, device=x_4.device))
+        img_embed += self.type_emb(torch.ones(img_embed.size(0), dtype=torch.long, device=img_embed.device))
+
+        x_input = torch.stack((x, x_2, x_3, x_4), dim=1)
+        x_input = torch.cat((x_input, img_embed), dim=1)
+        x = self.transformer.median_act(x_input, target)
+        x = self.output_proj(x)
+        return x
+
+
+class MyModel_large_KDD_squirrel(nn.Module):
+    def __init__(self, input_dim, class_dim, embed_dim, num_layers, num_heads, mlp_dim, dropout=0.1, image_dim=2048, img_embed_num=256):
+        super().__init__()
+        self.aggregator = SimpleAggregator()
+        self.aggregator1 = torch_geometric.nn.GCNConv(embed_dim, embed_dim)
+        self.aggregator2 = torch_geometric.nn.GCNConv(embed_dim, embed_dim)
+        self.transformer = Transformer(embed_dim, num_layers, num_heads, mlp_dim, dropout)
+        self.input_proj = nn.Linear(input_dim, embed_dim)
+        self.input_proj_img1 = nn.Linear(image_dim, embed_dim)
+        self.input_proj_img2 = nn.Linear(embed_dim, img_embed_num)
+        self.img_embed = nn.Embedding(img_embed_num, embed_dim)
+        self.output_proj = nn.Linear(embed_dim, class_dim)
+        self.dropout = dropout
+        self.token_representation = nn.Parameter(torch.randn(1, embed_dim))
+        self.type_emb = nn.Embedding(2, embed_dim)
+        self.hop_emb = nn.Embedding(3, embed_dim)
+        # self.prefix_token = nn.Embedding(10, embed_dim)
+
+    def get_img_label(self, img):
+        img = self.input_proj_img1(img)
+        img = F.tanh(img)
+        img = self.input_proj_img2(img)
+        img_y = torch.nn.functional.gumbel_softmax(img, tau=1, hard=True)
+        img_z = img_y.argmax(dim=-1)
+        return img_z
+
+        img_embed = self.img_embed(img_z)
+        x = self.output_proj(img_embed.squeeze(1))
+        return x.argmax(dim=-1)
+    
+    def forward(self, x, edge_index, img):
+        # token_representation = self.token_representation.expand(x.size(0), -1)
+        x = self.input_proj(x)
+        img = self.input_proj_img1(img)
+        img = F.relu(img)
+        # img = F.dropout(img, p=0.2, training=self.training) ## added
+        img = self.input_proj_img2(img)
+        img_y = torch.nn.functional.gumbel_softmax(img, tau=1, hard=True)
+        img_z = img_y.argmax(dim=-1)
+        img_embed = self.img_embed(img_z)
+        x_2_agg = self.aggregator(x, edge_index)
+        x_3_agg = self.aggregator(x_2_agg, edge_index)
+
+        
+
+        x_2 = self.aggregator1(x, edge_index)
+        x_3 = self.aggregator2(x_2, edge_index)
+
+        
+        img_embed += self.type_emb(torch.ones((img_embed.size(0), img_embed.size(1)), dtype=torch.long, device=img_embed.device))
+
+
+        x_input = torch.stack((x_3, x_2_agg), dim=1) # token_representation, 
+        # x_input = torch.stack((x, x_3_agg), dim=1) # token_representation, 
+        # x_input = torch.stack((x_2_agg, x_3_agg), dim=1) # token_representation, 
+        # x_input = x_3.unsqueeze(1) # token_representation, 
+    
+
+        # x_input = x_2.unsqueeze(1)
+        # x_input = torch.cat((x_input, img_embed), dim=1)
+        x_input = torch.cat((img_embed, x_input), dim=1)
+        # x_input = torch.cat((x_input, img_embed, prefix), dim=1)
+        # print(img_z.shape, x_input.shape, img_embed.shape)
+        # exit(0)
+        x = self.transformer(x_input)
+        x = self.output_proj(x)
+
+
+        # x = self.output_proj(img_embed.squeeze(1))
+        # return x[:, 2]
+
+        gate = torch.sigmoid(x[:, 0])
+        x = x[:, 0] * gate + (1 - gate) * x[:, -1]
+        return x
+
+    def median_act(self, x, edge_index, img, target):
+        x = self.input_proj(x)
+        # x = F.relu(x)
+        # x = F.dropout(x, p=0.2, training=self.training)
+        img = self.input_proj_img(img)
+        img_y = torch.nn.functional.gumbel_softmax(img, tau=1, hard=True)
+        img_z = img_y.argmax(dim=-1)
+        img_embed = self.img_embed(img_z)
+
+        x_2 = self.aggregator(x, edge_index)
+        x_3 = self.aggregator(x_2, edge_index)
+        x_4 = self.aggregator(x_3, edge_index)
+        # x_5 = self.aggregator(x_4, edge_index)
+        # x_input = torch.stack((x, x_2), dim=1)
+        # x_input = torch.stack((x, x_2, x_3), dim=1)
+
+        x_2 += self.type_emb(torch.zeros(x_2.size(0), dtype=torch.long, device=x_2.device))
+        x_3 += self.type_emb(torch.zeros(x_3.size(0), dtype=torch.long, device=x_3.device))
+        x_4 += self.type_emb(torch.zeros(x_4.size(0), dtype=torch.long, device=x_4.device))
+        img_embed += self.type_emb(torch.ones(img_embed.size(0), dtype=torch.long, device=img_embed.device))
+
+        x_input = torch.stack((x, x_2, x_3, x_4), dim=1)
+        x_input = torch.cat((x_input, img_embed), dim=1)
+        x = self.transformer.median_act(x_input, target)
+        x = self.output_proj(x)
+
+        # return x[:, 2]
+
+        gate = torch.sigmoid(x[:, 2])
+        x = x[:, 2] * gate + (1 - gate) * x[:, -1]
+        return x
+
+
+
+
+
+
+import math
+import numpy as np
+
+import torch_geometric
+import torch_geometric.utils as utils
+from torch_geometric.data import Data
+from torch_geometric.loader import DataLoader
+from torch_geometric.nn import GCNConv
+from torch_geometric.nn import SAGEConv
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+
+class SAGE_LLPE(nn.Module):
+    '''
+    SAGE with Learnable Laplacian Position Encodings
+    '''
+    def __init__(self, in_dim, pos_dim=8, h_dim=32, out_dim=1, K=4, num_layers=2, dropout=0):
+        super(SAGE_LLPE, self).__init__()
+        self.in_dim = in_dim
+        self.pos_dim = pos_dim
+        self.h_dim = h_dim
+        self.out_dim = out_dim
+        self.num_layers = num_layers
+        self.dropout = dropout
+        self.feat_enc = nn.Linear(in_dim, h_dim)
+
+        # Chebyshev polynomial parameters
+        self.K = K # order of Chebyshev polynomial
+        self.alpha = torch.nn.parameter.Parameter(torch.empty((self.K, pos_dim), requires_grad=True), requires_grad=True) # coefficients of Chebyshev Polynomials
+        nn.init.uniform_(self.alpha, -1/math.sqrt(self.K), 1/math.sqrt(self.K))
+
+        self.hidden_encs = nn.ModuleList()
+        for l in range(num_layers):
+            self.hidden_encs.append(SAGEConv(pos_dim+h_dim, pos_dim+h_dim))
+            self.hidden_encs.append(nn.ReLU())
+            self.hidden_encs.append(nn.Dropout(p=dropout))
+            
+        self.readout_layer = nn.Linear(pos_dim+h_dim, out_dim)
+        # self.readout_layer = nn.Linear(h_dim, out_dim)
+
+    def forward(self, data, device):
+        x = data.x
+        
+        # process eigenvectors: min-max normalization in range [-1, +1]
+        eigenvectors = data.eigenvectors
+        eig_min = torch.min(eigenvectors, dim=0, keepdim=True)[0]
+        eig_max = torch.max(eigenvectors, dim=0, keepdim=True)[0]
+        eigenvectors = (eigenvectors - eig_min)/(eig_max - eig_min + 1e-10) * (1 + 1) - 1 
+
+        # process eigenvalues: scale eigenvalues of Laplacian from [0, 2] --> [-1, +1]
+        eigenvalues = data.eigenvalues
+        eig_max = torch.max(eigenvalues)
+        eig_min = torch.min(eigenvalues)
+        eigenvalues = (eigenvalues - eig_min)/(eig_max - eig_min + 1e-10) * (1 + 1) - 1
+
+        # vectorized form of Chebyshev polynomial
+        eigenvalues = torch.arccos(torch.broadcast_to(eigenvalues[:, None], (eigenvalues.shape[0], self.K)))
+        eigenvalues = torch.mul(eigenvalues, torch.arange(self.K).to(device))
+        eigenvalues = torch.cos(eigenvalues)
+        eigenvalues = torch.matmul(eigenvalues, self.alpha)
+        
+        # pos encoding is the eigenvectors multiplied by chebyshev filters
+        pos = torch.matmul(eigenvectors, eigenvalues)
+        x = torch.cat([self.feat_enc(x), pos], dim=-1)
+        # x = torch.cat([x, pos], dim=-1)
+
+        edge_index = data.edge_index
+        for l, layer in enumerate(self.hidden_encs[:-1]): 
+            if np.mod(l, 3) == 0: 
+                x = layer(x, edge_index) # GCN layer
+            else: 
+                x = layer(x) # dropout and relu layers
+
+        x = self.readout_layer(x)
+        # x = F.log_softmax(x, dim=-1)
+        
+        return x, eigenvalues
+
+class GCN_LLPE(nn.Module):
+    '''
+    GCN with Learnable Laplacian Position Encodings
+    '''
+    def __init__(self, in_dim, pos_dim=8, h_dim=32, out_dim=1, K=64, num_layers=2, dropout=0):
+        super(GCN_LLPE, self).__init__()
+        self.in_dim = in_dim
+        self.pos_dim = pos_dim
+        self.h_dim = h_dim
+        self.out_dim = out_dim
+        self.num_layers = num_layers
+        self.dropout = dropout
+        self.feat_enc = nn.Linear(in_dim, h_dim)
+
+        # Chebyshev polynomial parameters
+        self.K = K # order of Chebyshev polynomial
+        self.alpha = torch.nn.parameter.Parameter(torch.empty((self.K, pos_dim), requires_grad=True), requires_grad=True) # coefficients of Chebyshev Polynomials
+        nn.init.uniform_(self.alpha, -1/math.sqrt(self.K), 1/math.sqrt(self.K))
+
+        self.hidden_encs = nn.ModuleList()
+        for l in range(num_layers):
+            self.hidden_encs.append(GCNConv(pos_dim+h_dim, pos_dim+h_dim))
+            self.hidden_encs.append(nn.ReLU())
+            self.hidden_encs.append(nn.Dropout(p=dropout))
+            
+        self.readout_layer = nn.Linear(pos_dim+h_dim, out_dim)
+        # self.readout_layer = nn.Linear(h_dim, out_dim)
+
+    def forward(self, data, device):
+        x = data.x
+        
+        # process eigenvectors: min-max normalization in range [-1, +1]
+        eigenvectors = data.eigenvectors
+        eig_min = torch.min(eigenvectors, dim=0, keepdim=True)[0]
+        eig_max = torch.max(eigenvectors, dim=0, keepdim=True)[0]
+        eigenvectors = (eigenvectors - eig_min)/(eig_max - eig_min + 1e-10) * (1 + 1) - 1 
+
+        # process eigenvalues: scale eigenvalues of Laplacian from [0, 2] --> [-1, +1]
+        eigenvalues = data.eigenvalues
+        eig_max = torch.max(eigenvalues)
+        eig_min = torch.min(eigenvalues)
+        eigenvalues = (eigenvalues - eig_min)/(eig_max - eig_min + 1e-10) * (1 + 1) - 1
+
+        # vectorized form of Chebyshev polynomial
+        eigenvalues = torch.arccos(torch.broadcast_to(eigenvalues[:, None], (eigenvalues.shape[0], self.K)))
+        eigenvalues = torch.mul(eigenvalues, torch.arange(self.K).to(device))
+        eigenvalues = torch.cos(eigenvalues)
+        eigenvalues = torch.matmul(eigenvalues, self.alpha)
+        
+        # pos encoding is the eigenvectors multiplied by chebyshev filters
+        pos = torch.matmul(eigenvectors, eigenvalues)
+        x = torch.cat([self.feat_enc(x), pos], dim=-1)
+        # x = torch.cat([x, pos], dim=-1)
+
+        edge_index = data.edge_index
+        for l, layer in enumerate(self.hidden_encs[:-1]): 
+            if np.mod(l, 3) == 0: 
+                x = layer(x, edge_index) # GCN layer
+            else: 
+                x = layer(x) # dropout and relu layers
+
+        x = self.readout_layer(x)
+        x = F.log_softmax(x, dim=-1)
+        
+        return x, eigenvalues
+
+
+class GAT_LLPE(nn.Module):
+    '''
+    SAGE with Learnable Laplacian Position Encodings
+    '''
+    def __init__(self, in_dim, pos_dim=8, h_dim=32, out_dim=1, K=64, num_layers=2, dropout=0):
+        super(GAT_LLPE, self).__init__()
+        self.in_dim = in_dim
+        self.pos_dim = pos_dim
+        self.h_dim = h_dim
+        self.out_dim = out_dim
+        self.num_layers = num_layers
+        self.dropout = dropout
+        self.feat_enc = nn.Linear(in_dim, h_dim)
+
+        # Chebyshev polynomial parameters
+        self.K = K # order of Chebyshev polynomial
+        self.alpha = torch.nn.parameter.Parameter(torch.empty((self.K, pos_dim), requires_grad=True), requires_grad=True) # coefficients of Chebyshev Polynomials
+        nn.init.uniform_(self.alpha, -1/math.sqrt(self.K), 1/math.sqrt(self.K))
+
+        self.hidden_encs = nn.ModuleList()
+        for l in range(num_layers):
+            self.hidden_encs.append(torch_geometric.nn.GATConv(pos_dim+h_dim, pos_dim+h_dim, heads=1, dropout=dropout))
+            self.hidden_encs.append(nn.ReLU())
+            self.hidden_encs.append(nn.Dropout(p=dropout))
+            
+        self.readout_layer = nn.Linear(pos_dim+h_dim, out_dim)
+        # self.readout_layer = nn.Linear(h_dim, out_dim)
+
+    def forward(self, data, device):
+        x = data.x
+        
+        # process eigenvectors: min-max normalization in range [-1, +1]
+        eigenvectors = data.eigenvectors
+        eig_min = torch.min(eigenvectors, dim=0, keepdim=True)[0]
+        eig_max = torch.max(eigenvectors, dim=0, keepdim=True)[0]
+        
+        eigenvectors = (eigenvectors - eig_min)/(eig_max - eig_min + 1e-10) * (1 + 1) - 1 
+
+        # process eigenvalues: scale eigenvalues of Laplacian from [0, 2] --> [-1, +1]
+        eigenvalues = data.eigenvalues
+        eig_max = torch.max(eigenvalues)
+        eig_min = torch.min(eigenvalues)
+        eigenvalues = (eigenvalues - eig_min)/(eig_max - eig_min + 1e-10) * (1 + 1) - 1
+
+        # vectorized form of Chebyshev polynomial
+        eigenvalues = torch.arccos(torch.broadcast_to(eigenvalues[:, None], (eigenvalues.shape[0], self.K)))
+        eigenvalues = torch.mul(eigenvalues, torch.arange(self.K).to(device))
+        eigenvalues = torch.cos(eigenvalues)
+        eigenvalues = torch.matmul(eigenvalues, self.alpha)
+        
+        # pos encoding is the eigenvectors multiplied by chebyshev filters
+        pos = torch.matmul(eigenvectors, eigenvalues)
+        x = torch.cat([self.feat_enc(x), pos], dim=-1)
+        # x = torch.cat([x, pos], dim=-1)
+
+        edge_index = data.edge_index
+        for l, layer in enumerate(self.hidden_encs[:-1]): 
+                # x = layer(x, edge_index) # GCN layer
+            if np.mod(l, 3) == 0: 
+                x = layer(x, edge_index) # GCN layer
+            else: 
+                x = layer(x) # dropout and relu layers
+
+        x = self.readout_layer(x)
+        # x = F.log_softmax(x, dim=-1)
+        
+        return x, eigenvalues
+
+
+class MyModel_large_KDD_struct(nn.Module):
+    def __init__(self, input_dim, class_dim, embed_dim, num_layers, num_heads, mlp_dim, dropout=0.1, image_dim=2048, img_embed_num=256):
+        super().__init__()
+        self.aggregator = SimpleAggregator()
+        self.aggregator1 = torch_geometric.nn.GCNConv(embed_dim, embed_dim)
+        self.aggregator2 = torch_geometric.nn.GCNConv(embed_dim, embed_dim)
+        self.aggregator3 = torch_geometric.nn.GCNConv(embed_dim, embed_dim)
+        self.transformer = Transformer(embed_dim, num_layers, num_heads, mlp_dim, dropout)
+        self.input_proj = nn.Linear(input_dim, embed_dim)
+        self.input_proj_img1 = nn.Linear(image_dim, embed_dim)
+        self.input_proj_img2 = nn.Linear(embed_dim, img_embed_num)
+        self.img_embed = nn.Embedding(img_embed_num, embed_dim)
+        self.output_proj = nn.Linear(embed_dim, class_dim)
+        self.dropout = dropout
+        self.token_representation = nn.Parameter(torch.randn(1, embed_dim))
+        self.type_emb = nn.Embedding(2, embed_dim)
+        self.hop_emb = nn.Embedding(3, embed_dim)
+        # self.prefix_token = nn.Embedding(10, embed_dim)
+
+        # self.check_gcn1 = torch_geometric.nn.GCNConv(input_dim, embed_dim)
+        # self.check_gcn2 = torch_geometric.nn.GCNConv(embed_dim, class_dim)
+
+    def get_img_label(self, img):
+        img = self.input_proj_img1(img)
+        img = F.relu(img)
+        img = self.input_proj_img2(img)
+        # img_y = torch.nn.functional.softmax(img, dim=-1)
+
+        img_y = img
+
+        
+        # img_y = torch.nn.functional.gumbel_softmax(img, tau=1, hard=True)
+        # print(img_y[0,0], img_y[200,0])
+        # print("*" * 20)
+        img_z = img_y.argmax(dim=-1)
+        return img_z
+
+        # img_embed = self.img_embed(img_z)
+        # x = self.output_proj(img_embed.squeeze(1))
+        # return x.argmax(dim=-1)
+    
+    def forward(self, x, edge_index, img):
+        # token_representation = self.token_representation.expand(x.size(0), -1)
+        # x = self.check_gcn1(x, edge_index)
+        # x = F.relu(x)
+        # x = F.dropout(x, p=0.5, training=self.training)
+        # x = self.check_gcn2(x, edge_index)
+        # return x
+
+
+
+        x = self.input_proj(x)
+
+        ## making image embedding with dataloaders
+
+
+        img = self.input_proj_img1(img)
+        img = F.relu(img)
+        img = self.input_proj_img2(img)
+
+        ### Softmax added
+        # img = F.softmax(img, dim=-1)
+
+        img_embed = torch.matmul(img, self.img_embed.weight)
+        
+        x_2_agg = self.aggregator(x, edge_index)
+        x_3_agg = self.aggregator(x_2_agg, edge_index)
+        x_4_agg = self.aggregator(x_3_agg, edge_index)
+        
+
+        x_2 = self.aggregator1(x, edge_index)
+        x_3 = self.aggregator2(x_2, edge_index)
+        x_4 = self.aggregator3(x_3, edge_index)
+        
+        
+        # img_embed += self.type_emb(torch.ones((img_embed.size(0), img_embed.size(1)), dtype=torch.long, device=img_embed.device))
+
+        # x_input = torch.stack((x_3, x_2_agg, x_3_agg), dim=1) # token_representation, 
+        # x_input = torch.stack((x_4, x_2_agg, x_3_agg, x_4_agg), dim=1) # token_representation, 
+        x_input = torch.stack((x_3, x_2, x), dim=1) # token_representation, 
+        
+        # return x_3
+        # x = self.transformer(x_input)
+        # return x[:, 0]
+
+
+        x_input = torch.cat((x_input, img_embed), dim=1)
+        # x_input = img_embed
+        x = self.transformer(x_input)
+        # return x[:, -1]
+        ### Gating
+
+        x = self.output_proj(x)
+        return x[:, -1]
+        gate = torch.sigmoid(x[:, 0])
+        x = x[:, 0] * gate + (1 - gate) * x[:, -1]
+        return x
+
+    def median_act(self, x, edge_index, img, target):
+        x = self.input_proj(x)
+        # x = F.relu(x)
+        # x = F.dropout(x, p=0.2, training=self.training)
+        img = self.input_proj_img(img)
+        img_y = torch.nn.functional.gumbel_softmax(img, tau=1, hard=True)
+        img_z = img_y.argmax(dim=-1)
+        img_embed = self.img_embed(img_z)
+
+        x_2 = self.aggregator(x, edge_index)
+        x_3 = self.aggregator(x_2, edge_index)
+        x_4 = self.aggregator(x_3, edge_index)
+        # x_5 = self.aggregator(x_4, edge_index)
+        # x_input = torch.stack((x, x_2), dim=1)
+        # x_input = torch.stack((x, x_2, x_3), dim=1)
+
+        x_2 += self.type_emb(torch.zeros(x_2.size(0), dtype=torch.long, device=x_2.device))
+        x_3 += self.type_emb(torch.zeros(x_3.size(0), dtype=torch.long, device=x_3.device))
+        x_4 += self.type_emb(torch.zeros(x_4.size(0), dtype=torch.long, device=x_4.device))
+        img_embed += self.type_emb(torch.ones(img_embed.size(0), dtype=torch.long, device=img_embed.device))
+
+        x_input = torch.stack((x, x_2, x_3, x_4), dim=1)
+        x_input = torch.cat((x_input, img_embed), dim=1)
+        x = self.transformer.median_act(x_input, target)
+        x = self.output_proj(x)
+        return x
