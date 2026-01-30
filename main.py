@@ -292,8 +292,7 @@ criterion = nn.CrossEntropyLoss()
 best_acc = 0
 
 my_model.train()
-for epoch in range(3000):
-# for epoch in range(1000):
+for epoch in range(400):
     optimizer.zero_grad()
     out = my_model(data.x, data.edge_index, embedding, mode=args.mode)
     loss = criterion(out[data.train_mask], data.y[data.train_mask])
@@ -310,15 +309,19 @@ for epoch in range(3000):
         with torch.no_grad():
             out = my_model(data.x, data.edge_index, embedding, mode=args.mode)
             pred = out.argmax(dim=1)
-            correct = pred[data.test_mask] == data.y[data.test_mask]
-            test_acc = int(correct.sum()) / int(data.test_mask.sum())
+            correct = pred[data.val_mask] == data.y[data.val_mask]
+            val_acc = int(correct.sum()) / int(data.val_mask.sum())
+            loss_val = criterion(out[data.val_mask], data.y[data.val_mask])
             # img_label = my_model.get_img_label(embedding).reshape(-1)
             # print(torch.bincount(img_label), img_label[:3])
-            print(f'Test Accuracy: {test_acc:.4f}')
-            if test_acc >= best_acc:
-                best_acc = test_acc
+            print(f'Validation Accuracy: {val_acc:.4f}')
+            if val_acc >= best_acc:
+                best_acc = val_acc
+                correct = pred[data.test_mask] == data.y[data.test_mask]
+                test_acc = int(correct.sum()) / int(data.test_mask.sum())
+                best_test_acc = test_acc
         my_model.train()
 
 with open(f'./results/{args.dataset_name}_gate_{args.missing_rate}_{args.model}_ICML.txt', 'a') as f:
-    f.write(f'embed_dim: {args.embed_dim}, num_layers: {args.num_layers}, num_heads: {args.num_heads}, mlp_dim: {args.mlp_dim}, dropout: {args.dropout}, lr: {args.lr}, img_embed_num: {args.img_embed_num}, best_acc: {best_acc}\n')
+    f.write(f'embed_dim: {args.embed_dim}, num_layers: {args.num_layers}, num_heads: {args.num_heads}, mlp_dim: {args.mlp_dim}, dropout: {args.dropout}, lr: {args.lr}, img_embed_num: {args.img_embed_num}, best_acc: {best_test_acc}\n')
 
