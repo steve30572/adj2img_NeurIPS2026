@@ -65,7 +65,7 @@ python main.py \
   --img_embed_num 200 \
   --missing_rate 0 \
   --mode hetero \
-  --seed 42
+  --seed 2026
 ```
 
 ## Hyperparameters for each dataset
